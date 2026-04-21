@@ -4,7 +4,7 @@ const {
   createSession,
   addChunk,
   stopSession,
-} = require("../services/call-session.service");
+} = require("../Services/call-session.service");
 const { log } = require("@ricky0123/vad-node/dist/_common");
 
 function registerAudioStream(server) {

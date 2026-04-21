@@ -1,11 +1,17 @@
 const fs = require("fs");
 const path = require("path");
 const { NonRealTimeVAD } = require("@ricky0123/vad-node");
+const { transcribeAudio } = require("./stt.service");
+const { runPartialTranscription } = require("../utils/partialtranscription");
+const { askAI } = require("./llm.service");
+const { log } = require("console");
+const { shouldSendToAI, isVague } = require("../utils/shouldSendToAI");
 
 const sessions = new Map();
 
 const SILENCE_THRESHOLD_MS = 2000;
-const SILENCE_CHECK_INTERVAL_MS = 500;
+const SILENCE_CHECK_INTERVAL_MS = 300;
+const PARTIAL_TRANSCRIBE_INTERVAL_MS = 1500;
 const audioDir = path.join(__dirname, "..", "temp-audio");
 
 let silenceMonitorStarted = false;
@@ -30,6 +36,10 @@ function createSession(sessionId, metadata = {}) {
     isProcessing: false,
     segmentIndex: 0,
     ingestPromise: Promise.resolve(),
+    lastPartialTranscriptAt: 0,
+    lastPartialText: "",
+    conversationHistory: [],
+    responseCache: {},
   });
 }
 
@@ -43,7 +53,7 @@ function updateSessionMetadata(sessionId, metadata = {}) {
   if (metadata.sampleRate) {
     session.sampleRate = normalizeSampleRate(
       metadata.sampleRate,
-      session.sampleRate
+      session.sampleRate,
     );
   }
 
@@ -82,12 +92,12 @@ async function addChunk(sessionId, chunk, metadata = {}) {
       session.probeBuffer = appendToRollingProbeBuffer(
         session.probeBuffer,
         normalized.pcm16le,
-        normalized.sampleRate
+        normalized.sampleRate,
       );
 
       const hasSpeech = await chunkContainsSpeech(
         session.probeBuffer,
-        normalized.sampleRate
+        normalized.sampleRate,
       );
 
       if (hasSpeech) {
@@ -127,7 +137,15 @@ function startSilenceMonitor() {
 
   setInterval(async () => {
     for (const [sessionId, session] of sessions.entries()) {
-      const silenceDuration = Date.now() - session.lastVoiceAt;
+      const now = Date.now();
+
+      const silenceDuration = now - session.lastVoiceAt;
+
+      const partialDuration = now - session.lastPartialTranscriptAt;
+
+      // =============================
+      // FINAL transcript (after silence)
+      // =============================
 
       if (
         session.hasSpeechSinceLastFlush &&
@@ -136,12 +154,47 @@ function startSilenceMonitor() {
         !session.isProcessing
       ) {
         await flushSession(sessionId);
+
+        // reset partial tracking
+        session.lastPartialText = "";
+        session.lastPartialTranscriptAt = 0;
+
+        continue;
+      }
+
+      // =============================
+      // PARTIAL transcript (while speaking)
+      // =============================
+
+      if (
+        session.hasSpeechSinceLastFlush &&
+        session.chunks.length &&
+        !session.isProcessing &&
+        !session.isPartialProcessing &&
+        partialDuration >= PARTIAL_TRANSCRIBE_INTERVAL_MS &&
+        silenceDuration < SILENCE_THRESHOLD_MS
+      ) {
+        const audioDir = path.join(process.cwd(), "temp-audio");
+
+        session.lastPartialTranscriptAt = now;
+        session.isPartialProcessing = true;
+
+        runPartialTranscription({
+          session,
+          extractSpeechSegments,
+          createWavBuffer,
+          transcribeAudio,
+          audioDir,
+        }).finally(() => {
+          session.isPartialProcessing = false;
+        });
       }
     }
   }, SILENCE_CHECK_INTERVAL_MS);
 }
 
 async function flushSession(sessionId) {
+
   const session = sessions.get(sessionId);
 
   if (!session || session.isProcessing || !session.chunks.length) {
@@ -153,36 +206,205 @@ async function flushSession(sessionId) {
   session.isProcessing = true;
 
   const pcm16le = Buffer.concat(session.chunks);
+
   session.chunks = [];
   session.probeBuffer = Buffer.alloc(0);
   session.hasSpeechSinceLastFlush = false;
 
+  let tempFile;
+
   try {
-    const segments = await extractSpeechSegments(
-      pcm16le,
-      session.sampleRate
-    );
 
-    for (const segment of segments) {
-      if (!segment.length) {
-        continue;
-      }
-
-      const fileName =
-        `${session.sessionId}-${session.segmentIndex}-${Date.now()}.wav`;
-
-      fs.writeFileSync(
-        path.join(audioDir, fileName),
-        createWavBuffer(segment, 16000)
+    const segments =
+      await extractSpeechSegments(
+        pcm16le,
+        session.sampleRate
       );
 
-      session.segmentIndex += 1;
+    if (!segments.length) {
+      return;
     }
-  } catch (error) {
-    console.error("VAD processing error:", error);
-  } finally {
-    session.isProcessing = false;
+
+
+    const mergedSegment =
+      Buffer.concat(segments);
+
+
+    tempFile =
+      path.join(
+        audioDir,
+        `temp-${Date.now()}.wav`
+      );
+
+
+    fs.writeFileSync(
+      tempFile,
+      createWavBuffer(
+        mergedSegment,
+        16000
+      )
+    );
+
+
+    // speech → text
+    let transcript =
+      await transcribeAudio(
+        tempFile
+      );
+
+
+    // remove extra spaces
+    transcript =
+      transcript
+        .replace(/\s+/g, " ")
+        .trim();
+
+
+    console.log(
+      "Transcript:",
+      transcript
+    );
+
+
+    // filter noise
+    if (  !shouldSendToAI(
+          transcript,
+          session
+        )) {
+
+      console.log(
+        "Ignored:",
+        transcript
+      );
+
+      return;
+    }
+
+
+    const normalized =
+      transcript.toLowerCase();
+
+
+    // check cache
+    if (
+      session.responseCache[
+        normalized
+      ]
+    ) {
+
+      console.log(
+        "Cache hit:",
+        normalized
+      );
+
+      console.log(
+        "AI:",
+        session.responseCache[
+          normalized
+        ]
+      );
+
+      return;
+    }
+    if (
+  isVague(transcript) &&
+  session.conversationHistory.length === 0
+) {
+
+  return "Could you repeat your question?";
+}
+
+
+
+    // call AI with history
+    const aiResponse =
+      await askAI(
+
+        transcript,
+
+        (token) => {
+
+          process.stdout.write(
+            token
+          );
+
+        },
+
+        session.conversationHistory
+
+      );
+
+
+    const cleanedResponse =
+      aiResponse
+        .replace(/\s+/g, " ")
+        .trim();
+
+
+    console.log(
+      "\nAI:",
+      cleanedResponse
+    );
+
+
+    // save in cache
+    session.responseCache[
+      normalized
+    ] = cleanedResponse;
+
+
+    // update history
+ if (transcript.split(" ").length > 1) {
+  session.conversationHistory.push({
+    user: transcript,
+    ai: cleanedResponse
+  });
+
+}
+
+
+    // keep last 6 turns only
+    if (
+      session.conversationHistory
+        .length > 6
+    ) {
+
+      session
+        .conversationHistory
+        .shift();
+
+    }
+
+
+    session.segmentIndex += 1;
+
+
   }
+  catch (error) {
+
+    console.error(
+      "VAD processing error:",
+      error
+    );
+
+  }
+  finally {
+
+    if (
+      tempFile &&
+      fs.existsSync(tempFile)
+    ) {
+
+      fs.unlinkSync(
+        tempFile
+      );
+
+    }
+
+    session.isProcessing = false;
+
+  }
+
 }
 
 async function extractSpeechSegments(pcm16le, sampleRate) {
@@ -206,11 +428,12 @@ async function chunkContainsSpeech(pcm16le, sampleRate) {
   return segments.length > 0;
 }
 
-function appendToRollingProbeBuffer(existingBuffer, incomingBuffer, sampleRate) {
-  const maxProbeBytes = Math.max(
-    sampleRate * 2 * 2,
-    incomingBuffer.length
-  );
+function appendToRollingProbeBuffer(
+  existingBuffer,
+  incomingBuffer,
+  sampleRate,
+) {
+  const maxProbeBytes = Math.max(sampleRate * 2 * 2, incomingBuffer.length);
 
   const combined = Buffer.concat([existingBuffer, incomingBuffer]);
 
@@ -291,6 +514,7 @@ function decodeMuLawBuffer(buffer) {
 }
 
 function decodeMuLawSample(value) {
+  // decodes the mulaw to pcm
   const MULAW_BIAS = 0x84;
   let sample = ~value;
   const sign = sample & 0x80;
@@ -320,9 +544,7 @@ function float32ToPcm16Buffer(float32Array) {
   for (let index = 0; index < float32Array.length; index += 1) {
     const sample = Math.max(-1, Math.min(1, float32Array[index]));
     const int16 =
-      sample < 0
-        ? Math.round(sample * 32768)
-        : Math.round(sample * 32767);
+      sample < 0 ? Math.round(sample * 32768) : Math.round(sample * 32767);
 
     buffer.writeInt16LE(int16, index * 2);
   }

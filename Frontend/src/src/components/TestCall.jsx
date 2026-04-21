@@ -5,11 +5,14 @@ export default function TestCall() {
   const mediaRef = useRef(null);
   const [isCalling, setIsCalling] = useState(false);
   const streamSid = "react-call-001";
-
+const [isConnecting, setIsConnecting] = useState(false);
   const startCall = async () => {
-    wsRef.current = new WebSocket("ws://localhost:3000/audio-stream");
+  setIsConnecting(true);
 
-    wsRef.current.onopen = async () => {
+  wsRef.current = new WebSocket("ws://localhost:3000/audio-stream");
+
+  wsRef.current.onopen = async () => {
+    try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: true,
       });
@@ -46,9 +49,9 @@ export default function TestCall() {
         const input = event.inputBuffer.getChannelData(0);
         const pcmData = new Int16Array(input.length);
 
-        for (let index = 0; index < input.length; index += 1) {
-          const sample = Math.max(-1, Math.min(1, input[index]));
-          pcmData[index] =
+        for (let i = 0; i < input.length; i++) {
+          const sample = Math.max(-1, Math.min(1, input[i]));
+          pcmData[i] =
             sample < 0
               ? Math.round(sample * 32768)
               : Math.round(sample * 32767);
@@ -69,9 +72,18 @@ export default function TestCall() {
       };
 
       setIsCalling(true);
-    };
+    } catch (error) {
+      console.error("Mic permission error:", error);
+    } finally {
+      setIsConnecting(false);
+    }
   };
 
+  wsRef.current.onerror = () => {
+    setIsConnecting(false);
+    alert("Connection failed");
+  };
+};
   const stopCall = () => {
     wsRef.current?.send(
       JSON.stringify({
@@ -102,14 +114,23 @@ export default function TestCall() {
     return btoa(binary);
   }
 
-  return (
-    <div>
-      <h2>Mic Test</h2>
-      {!isCalling ? (
-        <button onClick={startCall}>Start Call</button>
-      ) : (
-        <button onClick={stopCall}>End Call</button>
-      )}
-    </div>
-  );
+return (
+  <div>
+    <h2>Mic Test</h2>
+
+    {isConnecting && (
+  <div>
+    <div className="loader" />
+    <p>Connecting...</p>
+  </div>
+)}
+    {!isCalling && !isConnecting && (
+      <button onClick={startCall}>Start Call</button>
+    )}
+
+    {isCalling && (
+      <button onClick={stopCall}>End Call</button>
+    )}
+  </div>
+);
 }
