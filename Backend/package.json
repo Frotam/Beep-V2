@@ -2,17 +2,24 @@
   "name": "backend",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "api/server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "nodemon /api/server.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@ricky0123/vad-node": "^0.0.3",
     "bullmq": "^5.75.2",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
-    "redis": "^5.12.1"
+    "mic": "^2.1.2",
+    "nodemon": "^3.1.14",
+    "redis": "^5.12.1",
+    "twilio": "^6.0.0",
+    "wav": "^1.0.2",
+    "ws": "^8.20.0"
   }
 }
