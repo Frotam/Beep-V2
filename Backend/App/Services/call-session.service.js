@@ -1,18 +1,37 @@
 const fs = require("fs");
 const path = require("path");
 const { NonRealTimeVAD } = require("@ricky0123/vad-node");
-const { transcribeAudio } = require("./stt.service");
+const {
+  getSttStatus,
+  transcribeAudio,
+} = require("./stt.service");
 const { runPartialTranscription } = require("../utils/partialtranscription");
-const { askAI } = require("./llm.service");
-const { log } = require("console");
-const { shouldSendToAI, isVague } = require("../utils/shouldSendToAI");
+const {
+  askAI,
+  getLlmStatus,
+} = require("./llm.service");
+const {
+  isMeaningfulTranscript,
+  normalizeTranscript,
+  isVague,
+} = require("../utils/shouldSendToAI");
+const {
+  formatDigitsForSpeech,
+  getPhoneNumberCandidate,
+  looksLikePhoneRequest,
+} = require("../utils/number-parser");
+const { correctTranscript } = require("../utils/transcript-correction");
+const { runControlLayer } = require("../utils/control-layer");
 
 const sessions = new Map();
 
-const SILENCE_THRESHOLD_MS = 2000;
-const SILENCE_CHECK_INTERVAL_MS = 300;
-const PARTIAL_TRANSCRIBE_INTERVAL_MS = 1500;
+const SILENCE_THRESHOLD_MS = 700;
+const SILENCE_CHECK_INTERVAL_MS = 100;
+const PARTIAL_TRANSCRIBE_INTERVAL_MS = 800;
+const MIN_UTTERANCE_MS = 250;
+const MIN_RMS_FOR_SPEECH = 0.015;
 const audioDir = path.join(__dirname, "..", "temp-audio");
+const MAX_HISTORY_TURNS = 6;
 
 let silenceMonitorStarted = false;
 let vadPromise = null;
@@ -22,10 +41,22 @@ if (!fs.existsSync(audioDir)) {
 }
 
 function createSession(sessionId, metadata = {}) {
-  sessions.set(sessionId, {
+  const existingSession = sessions.get(sessionId);
+
+  if (existingSession) {
+    updateSessionMetadata(sessionId, metadata);
+
+    if (metadata.ws) {
+      existingSession.ws = metadata.ws;
+    }
+
+    return existingSession;
+  }
+
+  const session = {
     sessionId,
+    ws: metadata.ws || null,
     chunks: [],
-    probeBuffer: Buffer.alloc(0),
     sampleRate: normalizeSampleRate(metadata.sampleRate, 8000),
     encoding: normalizeEncoding(metadata.encoding),
     source: metadata.source || "unknown",
@@ -34,13 +65,33 @@ function createSession(sessionId, metadata = {}) {
     lastChunkAt: Date.now(),
     hasSpeechSinceLastFlush: false,
     isProcessing: false,
+    isPartialProcessing: false,
     segmentIndex: 0,
     ingestPromise: Promise.resolve(),
     lastPartialTranscriptAt: 0,
     lastPartialText: "",
+    lastFinalTranscript: "",
     conversationHistory: [],
     responseCache: {},
-  });
+    activeAiRequestId: 0,
+    isAiResponding: false,
+    currentAiText: "",
+    currentAiTranscript: "",
+    awaitingPhoneNumber: false,
+    collectedPhoneNumber: "",
+  };
+
+  sessions.set(sessionId, session);
+  return session;
+}
+
+function attachSocketToSession(sessionId, ws) {
+  const session = sessions.get(sessionId);
+
+  if (session) {
+    session.ws = ws;
+    sendModelStatus(session);
+  }
 }
 
 function updateSessionMetadata(sessionId, metadata = {}) {
@@ -63,6 +114,11 @@ function updateSessionMetadata(sessionId, metadata = {}) {
 
   if (metadata.source) {
     session.source = metadata.source;
+  }
+
+  if (metadata.ws) {
+    session.ws = metadata.ws;
+    sendModelStatus(session);
   }
 }
 
@@ -89,20 +145,17 @@ async function addChunk(sessionId, chunk, metadata = {}) {
 
       session.chunks.push(normalized.pcm16le);
 
-      session.probeBuffer = appendToRollingProbeBuffer(
-        session.probeBuffer,
-        normalized.pcm16le,
-        normalized.sampleRate,
-      );
-
-      const hasSpeech = await chunkContainsSpeech(
-        session.probeBuffer,
-        normalized.sampleRate,
-      );
+      const hasSpeech = chunkContainsSpeech(normalized.pcm16le);
 
       if (hasSpeech) {
         session.lastVoiceAt = Date.now();
         session.hasSpeechSinceLastFlush = true;
+
+        if (session.isAiResponding) {
+          sendSessionEvent(session, "assistant_interrupted", {
+            transcript: session.currentAiTranscript,
+          });
+        }
       }
     })
     .catch((error) => {
@@ -120,6 +173,7 @@ async function stopSession(sessionId) {
   }
 
   await session.ingestPromise;
+  cancelActiveAiResponse(session, { reason: "session_stopped" });
 
   if (session.chunks.length) {
     await flushSession(sessionId);
@@ -138,14 +192,8 @@ function startSilenceMonitor() {
   setInterval(async () => {
     for (const [sessionId, session] of sessions.entries()) {
       const now = Date.now();
-
       const silenceDuration = now - session.lastVoiceAt;
-
       const partialDuration = now - session.lastPartialTranscriptAt;
-
-      // =============================
-      // FINAL transcript (after silence)
-      // =============================
 
       if (
         session.hasSpeechSinceLastFlush &&
@@ -154,17 +202,10 @@ function startSilenceMonitor() {
         !session.isProcessing
       ) {
         await flushSession(sessionId);
-
-        // reset partial tracking
         session.lastPartialText = "";
         session.lastPartialTranscriptAt = 0;
-
         continue;
       }
-
-      // =============================
-      // PARTIAL transcript (while speaking)
-      // =============================
 
       if (
         session.hasSpeechSinceLastFlush &&
@@ -174,8 +215,6 @@ function startSilenceMonitor() {
         partialDuration >= PARTIAL_TRANSCRIBE_INTERVAL_MS &&
         silenceDuration < SILENCE_THRESHOLD_MS
       ) {
-        const audioDir = path.join(process.cwd(), "temp-audio");
-
         session.lastPartialTranscriptAt = now;
         session.isPartialProcessing = true;
 
@@ -185,6 +224,11 @@ function startSilenceMonitor() {
           createWavBuffer,
           transcribeAudio,
           audioDir,
+          onPartial: (transcript) => {
+            sendSessionEvent(session, "partial_transcript", {
+              transcript,
+            });
+          },
         }).finally(() => {
           session.isPartialProcessing = false;
         });
@@ -194,7 +238,6 @@ function startSilenceMonitor() {
 }
 
 async function flushSession(sessionId) {
-
   const session = sessions.get(sessionId);
 
   if (!session || session.isProcessing || !session.chunks.length) {
@@ -202,209 +245,396 @@ async function flushSession(sessionId) {
   }
 
   await session.ingestPromise;
-
   session.isProcessing = true;
 
   const pcm16le = Buffer.concat(session.chunks);
-
   session.chunks = [];
-  session.probeBuffer = Buffer.alloc(0);
   session.hasSpeechSinceLastFlush = false;
 
   let tempFile;
 
   try {
+    const speechDurationMs = Math.round(
+      (pcm16le.length / 2 / session.sampleRate) * 1000,
+    );
 
-    const segments =
-      await extractSpeechSegments(
-        pcm16le,
-        session.sampleRate
-      );
-
-    if (!segments.length) {
+    if (speechDurationMs < MIN_UTTERANCE_MS) {
       return;
     }
 
-
-    const mergedSegment =
-      Buffer.concat(segments);
-
-
-    tempFile =
-      path.join(
-        audioDir,
-        `temp-${Date.now()}.wav`
-      );
-
+    tempFile = path.join(audioDir, `temp-${Date.now()}.wav`);
 
     fs.writeFileSync(
       tempFile,
-      createWavBuffer(
-        mergedSegment,
-        16000
-      )
+      createWavBuffer(pcm16le, session.sampleRate),
     );
 
+    let transcript = await transcribeAudio(tempFile);
+    transcript = normalizeTranscript(transcript);
 
-    // speech → text
-    let transcript =
-      await transcribeAudio(
-        tempFile
-      );
-
-
-    // remove extra spaces
-    transcript =
-      transcript
-        .replace(/\s+/g, " ")
-        .trim();
-
-
-    console.log(
-      "Transcript:",
-      transcript
-    );
-
-
-    // filter noise
-    if (  !shouldSendToAI(
-          transcript,
-          session
-        )) {
-
-      console.log(
-        "Ignored:",
-        transcript
-      );
-
+    if (!transcript) {
       return;
     }
 
+    const correction = correctTranscript({
+      transcript,
+      currentAiText: session.currentAiText,
+      conversationHistory: session.conversationHistory,
+    });
 
-    const normalized =
-      transcript.toLowerCase();
-
-
-    // check cache
     if (
-      session.responseCache[
-        normalized
-      ]
+      correction.correctedTranscript &&
+      correction.correctedTranscript !== transcript
     ) {
+      sendSessionEvent(session, "transcript_corrected", {
+        originalTranscript: transcript,
+        correctedTranscript: correction.correctedTranscript,
+        intent: correction.intent,
+        corrections: correction.corrections,
+      });
+    }
 
-      console.log(
-        "Cache hit:",
-        normalized
+    transcript = correction.correctedTranscript || transcript;
+    const controlDecision = runControlLayer({
+      transcript: correction.originalTranscript || transcript,
+      correctedTranscript: transcript,
+      session,
+    });
+
+    const phoneCapture = handlePhoneNumberCapture(session, transcript);
+
+    if (phoneCapture.handled) {
+      sendSessionEvent(session, "final_transcript", {
+        transcript: phoneCapture.transcript,
+      });
+      console.log("Transcript:", phoneCapture.transcript);
+      sendAssistantResponse(session, phoneCapture.transcript, phoneCapture.reply, {
+        fromCache: false,
+      });
+      rememberConversationTurn(
+        session,
+        phoneCapture.transcript,
+        phoneCapture.reply,
       );
-
-      console.log(
-        "AI:",
-        session.responseCache[
-          normalized
-        ]
-      );
-
       return;
     }
-    if (
-  isVague(transcript) &&
-  session.conversationHistory.length === 0
-) {
 
-  return "Could you repeat your question?";
-}
+    sendSessionEvent(session, "final_transcript", { transcript });
+    console.log("Transcript:", transcript);
+    sendSessionEvent(session, "control_decision", {
+      transcript,
+      intent: controlDecision.intent,
+      confidence: controlDecision.confidence,
+      action: controlDecision.action,
+      reason: controlDecision.reason,
+    });
 
-
-
-    // call AI with history
-    const aiResponse =
-      await askAI(
-
+    if (controlDecision.action === "ignore") {
+      sendSessionEvent(session, "ignored_transcript", {
         transcript,
+        reason: controlDecision.reason,
+      });
 
-        (token) => {
+      if (
+        controlDecision.allowCurrentResponseToContinue &&
+        session.isAiResponding
+      ) {
+        sendSessionEvent(session, "assistant_resumed", {
+          transcript: session.currentAiTranscript,
+        });
+      }
 
-          process.stdout.write(
-            token
-          );
-
-        },
-
-        session.conversationHistory
-
-      );
-
-
-    const cleanedResponse =
-      aiResponse
-        .replace(/\s+/g, " ")
-        .trim();
-
-
-    console.log(
-      "\nAI:",
-      cleanedResponse
-    );
-
-
-    // save in cache
-    session.responseCache[
-      normalized
-    ] = cleanedResponse;
-
-
-    // update history
- if (transcript.split(" ").length > 1) {
-  session.conversationHistory.push({
-    user: transcript,
-    ai: cleanedResponse
-  });
-
-}
-
-
-    // keep last 6 turns only
-    if (
-      session.conversationHistory
-        .length > 6
-    ) {
-
-      session
-        .conversationHistory
-        .shift();
-
+      return;
     }
 
+    if (controlDecision.action === "respond") {
+      sendSessionEvent(session, "ignored_transcript", {
+        transcript,
+        reason: controlDecision.reason,
+      });
+      sendAssistantResponse(session, transcript, controlDecision.reply, {
+        fromCache: false,
+      });
+      rememberConversationTurn(session, transcript, controlDecision.reply);
+      return;
+    }
 
-    session.segmentIndex += 1;
+    if (session.isAiResponding) {
+      cancelActiveAiResponse(session, { reason: "user_interrupt" });
+    }
 
+    const normalizedTranscript = controlDecision.normalized;
+    const cachedResponse = session.responseCache[normalizedTranscript];
 
-  }
-  catch (error) {
+    if (cachedResponse) {
+      session.currentAiTranscript = transcript;
+      session.currentAiText = cachedResponse;
 
-    console.error(
-      "VAD processing error:",
-      error
+      sendSessionEvent(session, "cache_hit", {
+        transcript,
+        response: cachedResponse,
+      });
+
+      sendAssistantResponse(session, transcript, cachedResponse, {
+        fromCache: true,
+      });
+      rememberConversationTurn(session, transcript, cachedResponse);
+      return;
+    }
+
+    if (isVague(transcript) && session.conversationHistory.length === 0) {
+      const clarification = "Could you repeat your question?";
+      sendAssistantResponse(session, transcript, clarification, {
+        fromCache: false,
+      });
+      rememberConversationTurn(session, transcript, clarification);
+      return;
+    }
+
+    await generateAiResponse(
+      session,
+      transcript,
+      normalizedTranscript,
+      controlDecision.intent,
     );
-
-  }
-  finally {
-
-    if (
-      tempFile &&
-      fs.existsSync(tempFile)
-    ) {
-
-      fs.unlinkSync(
-        tempFile
-      );
-
+  } catch (error) {
+    console.error("VAD processing error:", error);
+    sendSessionEvent(session, "assistant_error", {
+      message: error.message || "Unable to process audio.",
+    });
+  } finally {
+    if (tempFile && fs.existsSync(tempFile)) {
+      fs.unlinkSync(tempFile);
     }
 
     session.isProcessing = false;
+  }
+}
 
+async function generateAiResponse(
+  session,
+  transcript,
+  normalizedTranscript,
+  detectedIntent = "general",
+) {
+  const requestId = session.activeAiRequestId + 1;
+  const abortController = new AbortController();
+
+  session.activeAiRequestId = requestId;
+  session.isAiResponding = true;
+  session.currentAiText = "";
+  session.currentAiTranscript = transcript;
+  session.activeAiAbortController = abortController;
+
+  sendSessionEvent(session, "assistant_started", {
+    transcript,
+  });
+
+  try {
+    const aiResponse = await askAI({
+      transcript,
+      detectedIntent,
+      historyText: formatConversationHistory(session.conversationHistory),
+      signal: abortController.signal,
+      onToken: (token) => {
+        if (session.activeAiRequestId !== requestId) {
+          return;
+        }
+
+        session.currentAiText += token;
+        sendSessionEvent(session, "assistant_token", {
+          token,
+          text: session.currentAiText,
+        });
+      },
+    });
+
+    if (session.activeAiRequestId !== requestId) {
+      return;
+    }
+
+    const cleanedResponse = normalizeTranscript(aiResponse);
+
+    if (!cleanedResponse) {
+      sendSessionEvent(session, "assistant_error", {
+        message: "Assistant returned an empty response.",
+      });
+      return;
+    }
+
+    session.responseCache[normalizedTranscript] = cleanedResponse;
+    session.currentAiText = cleanedResponse;
+    updatePhoneCollectionState(session, cleanedResponse);
+
+    sendSessionEvent(session, "assistant_completed", {
+      transcript,
+      response: cleanedResponse,
+      fromCache: false,
+    });
+
+    rememberConversationTurn(session, transcript, cleanedResponse);
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      return;
+    }
+
+    console.error("AI response error:", error);
+    sendSessionEvent(session, "assistant_error", {
+      message: error.message || "Assistant response failed.",
+    });
+  } finally {
+    if (session.activeAiRequestId === requestId) {
+      session.isAiResponding = false;
+      session.activeAiAbortController = null;
+    }
+  }
+}
+
+function sendAssistantResponse(session, transcript, response, options = {}) {
+  session.isAiResponding = false;
+  session.activeAiAbortController = null;
+  session.currentAiText = response;
+  session.currentAiTranscript = transcript;
+  updatePhoneCollectionState(session, response);
+
+  sendSessionEvent(session, "assistant_started", {
+    transcript,
+  });
+
+  sendSessionEvent(session, "assistant_completed", {
+    transcript,
+    response,
+    fromCache: Boolean(options.fromCache),
+  });
+}
+
+function cancelActiveAiResponse(session, details = {}) {
+  if (!session?.isAiResponding) {
+    return;
   }
 
+  session.activeAiRequestId += 1;
+  session.isAiResponding = false;
+
+  if (session.activeAiAbortController) {
+    session.activeAiAbortController.abort();
+    session.activeAiAbortController = null;
+  }
+
+  sendSessionEvent(session, "assistant_cancelled", {
+    reason: details.reason || "cancelled",
+    transcript: session.currentAiTranscript,
+    partialResponse: session.currentAiText,
+  });
+}
+
+function rememberConversationTurn(session, transcript, response) {
+  if (!isMeaningfulTranscript(transcript)) {
+    return;
+  }
+
+  session.conversationHistory.push({
+    user: transcript,
+    ai: response,
+  });
+
+  while (session.conversationHistory.length > MAX_HISTORY_TURNS) {
+    session.conversationHistory.shift();
+  }
+}
+
+function formatConversationHistory(history) {
+  if (!Array.isArray(history) || !history.length) {
+    return "No prior conversation.";
+  }
+
+  return history
+    .map(
+      (turn, index) =>
+        `Turn ${index + 1}\nUser: ${turn.user}\nAssistant: ${turn.ai}`,
+    )
+    .join("\n\n");
+}
+
+function sendSessionEvent(session, type, payload = {}) {
+  if (!session?.ws || session.ws.readyState !== 1) {
+    return;
+  }
+
+  try {
+    session.ws.send(
+      JSON.stringify({
+        type,
+        sessionId: session.sessionId,
+        ...payload,
+      }),
+    );
+  } catch (error) {
+    console.error("WebSocket send error:", error.message);
+  }
+}
+
+function sendModelStatus(session) {
+  const stt = getSttStatus();
+  const llm = getLlmStatus();
+
+  sendSessionEvent(session, "model_status", {
+    ready: stt.ready && llm.ready,
+    stt,
+    llm,
+  });
+}
+
+function handlePhoneNumberCapture(session, transcript) {
+  if (!session.awaitingPhoneNumber && !looksLikePhoneRequest(session.currentAiText)) {
+    return {
+      handled: false,
+      transcript,
+    };
+  }
+
+  const candidate = getPhoneNumberCandidate(transcript);
+
+  if (!candidate.digits) {
+    return {
+      handled: false,
+      transcript,
+    };
+  }
+
+  if (!candidate.isValidPhoneNumber) {
+    session.awaitingPhoneNumber = true;
+
+    return {
+      handled: true,
+      transcript: `Phone number: ${candidate.digits}`,
+      reply: "Invalid number, please repeat your 10 digit number.",
+    };
+  }
+
+  session.awaitingPhoneNumber = false;
+  session.collectedPhoneNumber = candidate.digits;
+
+  return {
+    handled: true,
+    transcript: `Phone number: ${candidate.digits}`,
+    reply: `I heard ${formatDigitsForSpeech(candidate.digits)}. Please confirm.`,
+  };
+}
+
+function updatePhoneCollectionState(session, response) {
+  if (!response) {
+    return;
+  }
+
+  if (looksLikePhoneRequest(response)) {
+    session.awaitingPhoneNumber = true;
+    return;
+  }
+
+  if (session.collectedPhoneNumber && !looksLikePhoneRequest(response)) {
+    session.awaitingPhoneNumber = false;
+  }
 }
 
 async function extractSpeechSegments(pcm16le, sampleRate) {
@@ -423,25 +653,8 @@ async function extractSpeechSegments(pcm16le, sampleRate) {
   return segments;
 }
 
-async function chunkContainsSpeech(pcm16le, sampleRate) {
-  const segments = await extractSpeechSegments(pcm16le, sampleRate);
-  return segments.length > 0;
-}
-
-function appendToRollingProbeBuffer(
-  existingBuffer,
-  incomingBuffer,
-  sampleRate,
-) {
-  const maxProbeBytes = Math.max(sampleRate * 2 * 2, incomingBuffer.length);
-
-  const combined = Buffer.concat([existingBuffer, incomingBuffer]);
-
-  if (combined.length <= maxProbeBytes) {
-    return combined;
-  }
-
-  return combined.subarray(combined.length - maxProbeBytes);
+function chunkContainsSpeech(pcm16le) {
+  return calculateRms(pcm16le) >= MIN_RMS_FOR_SPEECH;
 }
 
 async function getVad() {
@@ -482,9 +695,7 @@ function normalizeIncomingAudio(base64Payload, metadata) {
 }
 
 function normalizeEncoding(value) {
-  const normalized = String(value || "")
-    .trim()
-    .toLowerCase();
+  const normalized = String(value || "").trim().toLowerCase();
 
   if (
     normalized === "audio/x-mulaw" ||
@@ -514,17 +725,13 @@ function decodeMuLawBuffer(buffer) {
 }
 
 function decodeMuLawSample(value) {
-  // decodes the mulaw to pcm
-  const MULAW_BIAS = 0x84;
-  let sample = ~value;
-  const sign = sample & 0x80;
-  const exponent = (sample >> 4) & 0x07;
-  const mantissa = sample & 0x0f;
+  const muLaw = (~value) & 0xff;
+  const sign = muLaw & 0x80;
+  const exponent = (muLaw >> 4) & 0x07;
+  const mantissa = muLaw & 0x0f;
+  const magnitude = ((mantissa | 0x10) << (exponent + 3)) - 132;
 
-  sample = ((mantissa << 4) + 0x08) << exponent;
-  sample -= MULAW_BIAS;
-
-  return sign ? -sample : sample;
+  return sign ? -magnitude : magnitude;
 }
 
 function pcm16ToFloat32(buffer) {
@@ -536,6 +743,23 @@ function pcm16ToFloat32(buffer) {
   }
 
   return output;
+}
+
+function calculateRms(buffer) {
+  const sampleCount = Math.floor(buffer.length / 2);
+
+  if (!sampleCount) {
+    return 0;
+  }
+
+  let sumSquares = 0;
+
+  for (let index = 0; index < sampleCount; index += 1) {
+    const sample = buffer.readInt16LE(index * 2) / 32768;
+    sumSquares += sample * sample;
+  }
+
+  return Math.sqrt(sumSquares / sampleCount);
 }
 
 function float32ToPcm16Buffer(float32Array) {
@@ -578,6 +802,7 @@ function createWavBuffer(pcmBuffer, sampleRate) {
 
 module.exports = {
   addChunk,
+  attachSocketToSession,
   createSession,
   startSilenceMonitor,
   stopSession,

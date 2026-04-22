@@ -1,26 +1,35 @@
-function shouldSendToAI(text, session) {
+function normalizeTranscript(text) {
+  return String(text || "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
-  if (!text) return false;
+function normalizeForComparison(text) {
+  return normalizeTranscript(text).toLowerCase();
+}
 
-  const cleaned =
-    text
-      .trim()
-      .toLowerCase();
+function shouldSendToAI(text, session = {}) {
+  const cleaned = normalizeForComparison(text);
 
+  if (!cleaned.length) {
+    return {
+      shouldSend: false,
+      reason: "empty",
+      normalized: cleaned,
+      allowCurrentResponseToContinue: true,
+    };
+  }
 
-  // ignore empty
-  if (!cleaned.length)
-    return false;
+  if (cleaned.length === 1) {
+    return {
+      shouldSend: false,
+      reason: "single_character_noise",
+      normalized: cleaned,
+      allowCurrentResponseToContinue: true,
+    };
+  }
 
-
-  // ignore very tiny noise
-  if (cleaned.length === 1)
-    return false;
-
-
-  // common noise / filler sounds
-  const ignoreList = [
-
+  const ignoreList = new Set([
     "uh",
     "um",
     "hmm",
@@ -29,76 +38,98 @@ function shouldSendToAI(text, session) {
     "mmm",
     "aaa",
     "eh",
-
+    "mm",
+    "hm",
     "you you",
     "ha ha",
+  ]);
 
-  ];
+  if (ignoreList.has(cleaned)) {
+    return {
+      shouldSend: false,
+      reason: "filler_noise",
+      normalized: cleaned,
+      allowCurrentResponseToContinue: true,
+    };
+  }
 
+  if (/^[hmauoe\s]+$/.test(cleaned) && cleaned.length <= 6) {
+    return {
+      shouldSend: false,
+      reason: "phonetic_noise",
+      normalized: cleaned,
+      allowCurrentResponseToContinue: true,
+    };
+  }
 
-  if (ignoreList.includes(cleaned))
+  if (cleaned.split(" ").length <= 2 && cleaned.length <= 3) {
+    return {
+      shouldSend: false,
+      reason: "too_short",
+      normalized: cleaned,
+      allowCurrentResponseToContinue: true,
+    };
+  }
+
+  if (cleaned === session.lastFinalTranscript) {
+    return {
+      shouldSend: false,
+      reason: "duplicate_transcript",
+      normalized: cleaned,
+      allowCurrentResponseToContinue: true,
+    };
+  }
+
+  session.lastFinalTranscript = cleaned;
+
+  return {
+    shouldSend: true,
+    reason: "valid",
+    normalized: cleaned,
+    allowCurrentResponseToContinue: false,
+  };
+}
+
+function isMeaningfulTranscript(text) {
+  const cleaned = normalizeForComparison(text);
+
+  if (!cleaned) {
     return false;
+  }
 
-
-
-  // allow meaningful short commands
-  const allowedShortWords = [
-
+  const nonMeaningfulGreetings = new Set([
     "hi",
     "hello",
     "hey",
-    "menu",
-    "price",
-    "yes",
-    "no",
     "thanks",
     "thank you",
-    "veg",
-    "food",
-    "order"
+  ]);
 
-  ];
-
-
-  if (allowedShortWords.includes(cleaned))
-    return true;
-
-
-
-  // avoid repeated same transcript
-  if (
-    cleaned === session.lastFinalTranscript
-  )
+  if (nonMeaningfulGreetings.has(cleaned)) {
     return false;
+  }
 
-
-  session.lastFinalTranscript =
-    cleaned;
-
-
-  return true;
-
+  return cleaned.split(" ").length > 1 || cleaned.length > 6;
 }
+
 function isVague(text) {
-
+  const t = normalizeForComparison(text);
   const vaguePatterns = [
-
     "earlier",
     "previous",
     "that",
     "same",
     "repeat",
     "again",
-    "what i said"
-
+    "what i said",
   ];
 
-  const t = text.toLowerCase();
-
-  return vaguePatterns.some(p => t.includes(p));
-
+  return vaguePatterns.some((pattern) => t.includes(pattern));
 }
-module.exports={
-    shouldSendToAI,
-    isVague
-}
+
+module.exports = {
+  isMeaningfulTranscript,
+  isVague,
+  normalizeTranscript,
+  shouldSendToAI,
+};

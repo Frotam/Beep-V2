@@ -4,8 +4,8 @@ const {
   createSession,
   addChunk,
   stopSession,
+  attachSocketToSession,
 } = require("../Services/call-session.service");
-const { log } = require("@ricky0123/vad-node/dist/_common");
 
 function registerAudioStream(server) {
   const wss = new WebSocket.Server({
@@ -15,6 +15,7 @@ function registerAudioStream(server) {
 
   wss.on("connection", (ws) => {
     console.log("WebSocket connected");
+    let activeSessionId = null;
 
     ws.on("message", async (message) => {
       try {
@@ -28,26 +29,46 @@ function registerAudioStream(server) {
         // console.log(sessionId);
 
         if (data.event === "start") {
-          createSession(sessionId, getStreamMetadata(data));
+          activeSessionId = sessionId;
+          createSession(sessionId, {
+            ...getStreamMetadata(data),
+            ws,
+          });
+          attachSocketToSession(sessionId, ws);
           console.log("call started:", sessionId);
           console.log("call started:", getStreamMetadata(data));
           return;
         }
 
         if (data.event === "media" && data.media?.payload) {
+          if (!activeSessionId) {
+            activeSessionId = sessionId;
+            attachSocketToSession(sessionId, ws);
+          }
+
           await addChunk(
             sessionId,
             data.media.payload,
-            getStreamMetadata(data)
+            {
+              ...getStreamMetadata(data),
+              ws,
+            }
           );
           return;
         }
 
         if (data.event === "stop") {
           await stopSession(sessionId);
+          activeSessionId = null;
         }
       } catch (err) {
         console.error("WS error:", err.message);
+      }
+    });
+
+    ws.on("close", async () => {
+      if (activeSessionId) {
+        await stopSession(activeSessionId);
       }
     });
   });

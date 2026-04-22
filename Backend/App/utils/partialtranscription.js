@@ -6,11 +6,10 @@ const path = require("path");
 async function runPartialTranscription({
 
   session,
-  extractSpeechSegments,
   createWavBuffer,
   transcribeAudio,
-  audioDir
-  
+  audioDir,
+  onPartial,
 
 }) {
 
@@ -24,20 +23,15 @@ async function runPartialTranscription({
       Buffer.concat(session.chunks);
 
 
-    const segments =
-      await extractSpeechSegments(
-        pcm16le,
-        session.sampleRate
+    const durationMs =
+      Math.round(
+        (pcm16le.length / 2 / session.sampleRate) * 1000
       );
 
 
-    if (!segments.length) {
+    if (durationMs < 300) {
       return;
     }
-
-
-    const mergedSegment =
-      Buffer.concat(segments);
 
 
     const tempFile =
@@ -50,34 +44,40 @@ async function runPartialTranscription({
     fs.writeFileSync(
       tempFile,
       createWavBuffer(
-        mergedSegment,
-        16000
+        pcm16le,
+        session.sampleRate
       )
     );
 
 
-    const transcript =
-      await transcribeAudio(
-        tempFile
-      );
+    const transcript = await transcribeAudio(tempFile);
 
 
     fs.unlinkSync(tempFile);
 
+    const cleanedTranscript =
+      String(transcript || "")
+        .replace(/\s+/g, " ")
+        .trim();
+
 
     if (
-      transcript &&
-      transcript !== session.lastPartialText
+      cleanedTranscript &&
+      cleanedTranscript !== session.lastPartialText
     ) {
 
       console.log(
         "Partial:",
-        transcript
+        cleanedTranscript
       );
 
 
       session.lastPartialText =
-        transcript;
+        cleanedTranscript;
+
+      if (onPartial) {
+        onPartial(cleanedTranscript);
+      }
 
     }
 
